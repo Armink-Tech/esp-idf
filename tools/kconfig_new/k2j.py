@@ -30,12 +30,7 @@ import sys
 import tempfile
 
 import gen_kconfig_doc
-
-try:
-    from . import kconfiglib
-except Exception:
-    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-    import kconfiglib
+import kconfiglib
 
 __version__ = "0.1"
 
@@ -169,46 +164,24 @@ class DeprecatedOptions(object):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='confgen.py v%s - Config Generation Tool' % __version__, prog=os.path.basename(sys.argv[0]))
+    parser = argparse.ArgumentParser(description='k2j', prog=os.path.basename(sys.argv[0]))
 
     parser.add_argument('--config',
-                        help='Project configuration settings',
                         nargs='?',
                         default=None)
 
-    parser.add_argument('--defaults',
-                        help='Optional project defaults file, used if --config file doesn\'t exist. '
-                             'Multiple files can be specified using multiple --defaults arguments.',
-                        nargs='?',
-                        default=[],
-                        action='append')
-
     parser.add_argument('--kconfig',
-                        help='KConfig file with config item definitions',
                         required=True)
 
-    parser.add_argument('--sdkconfig-rename',
-                        help='File with deprecated Kconfig options',
-                        required=False)
-
     parser.add_argument('--output', nargs=2, action='append',
-                        help='Write output file (format and output filename)',
                         metavar=('FORMAT', 'FILENAME'),
                         default=[])
-
-    parser.add_argument('--env', action='append', default=[],
-                        help='Environment to set when evaluating the config file', metavar='NAME=VAL')
-
-    parser.add_argument('--env-file', type=argparse.FileType('r'),
-                        help='Optional file to load environment variables from. Contents '
-                             'should be a JSON object where each key/value pair is a variable.')
-
+                        
     args = parser.parse_args()
 
-    for fmt, filename in args.output:
-        if fmt not in OUTPUT_FORMATS.keys():
-            print("Format '%s' not recognised. Known formats: %s" % (fmt, OUTPUT_FORMATS.keys()))
-            sys.exit(1)
+    args.env = []
+    args.defaults = []
+    args.sdkconfig_rename = False
 
     try:
         args.env = [(name,value) for (name,value) in (e.split("=",1) for e in args.env)]
@@ -216,20 +189,10 @@ def main():
         print("--env arguments must each contain =. To unset an environment variable, use 'ENV='")
         sys.exit(1)
 
-    for name, value in args.env:
-        os.environ[name] = value
-
-    if args.env_file is not None:
-        env = json.load(args.env_file)
-        os.environ.update(env)
 
     config = kconfiglib.Kconfig(args.kconfig)
     config.disable_redun_warnings()
     config.disable_override_warnings()
-
-    sdkconfig_renames = [args.sdkconfig_rename] if args.sdkconfig_rename else []
-    sdkconfig_renames += os.environ.get("COMPONENT_SDKCONFIG_RENAMES", "").split()
-    deprecated_options = DeprecatedOptions(config.config_prefix, path_rename_files=sdkconfig_renames)
 
     if len(args.defaults) > 0:
         # always load defaults first, so any items which are not defined in that config
@@ -238,21 +201,16 @@ def main():
             print("Loading defaults file %s..." % name)
             if not os.path.exists(name):
                 raise RuntimeError("Defaults file not found: %s" % name)
-            try:
-                with tempfile.NamedTemporaryFile(prefix="confgen_tmp", delete=False) as f:
-                    temp_file = f.name
-                deprecated_options.replace(sdkconfig_in=name, sdkconfig_out=temp_file)
-                config.load_config(temp_file, replace=False)
-            finally:
-                try:
-                    os.remove(temp_file)
-                except OSError:
-                    pass
+            config.load_config(name, replace=False)
+
+    sdkconfig_renames = [args.sdkconfig_rename] if args.sdkconfig_rename else []
+    sdkconfig_renames += os.environ.get("COMPONENT_SDKCONFIG_RENAMES", "").split()
+    deprecated_options = DeprecatedOptions(config.config_prefix, path_rename_files=sdkconfig_renames)
 
     # If config file previously exists, load it
     if args.config and os.path.exists(args.config):
         # ... but replace deprecated options before that
-        with tempfile.NamedTemporaryFile(prefix="confgen_tmp", delete=False) as f:
+        with tempfile.NamedTemporaryFile(prefix = "k2j_tmp", delete = False) as f:
             temp_file = f.name
         try:
             deprecated_options.replace(sdkconfig_in=args.config, sdkconfig_out=temp_file)
@@ -266,7 +224,7 @@ def main():
 
     # Output the files specified in the arguments
     for output_type, filename in args.output:
-        with tempfile.NamedTemporaryFile(prefix="confgen_tmp", delete=False) as f:
+        with tempfile.NamedTemporaryFile(prefix = "k2j_tmp", delete = False) as f:
             temp_file = f.name
         try:
             output_function = OUTPUT_FORMATS[output_type]
@@ -279,20 +237,81 @@ def main():
                 pass
 
 
+# judge if it's CONFIG_PKG_XX_PATH or CONFIG_PKG_XX_VER
+def is_pkg_special_config(config_str):
+    if type(config_str) == type('a'):
+        if config_str.startswith("PKG_") and (config_str.endswith('_PATH') or config_str.endswith('_VER')):
+            return True
+    return False
+
+
+def mk_rtconfig(filename):
+    try:
+        config = open(filename, 'r')
+    except:
+        print('open config:%s failed' % filename)
+        return
+
+    with open('rtconfig.h', 'w') as rtconfig:
+
+        rtconfig.write('#ifndef RT_CONFIG_H__\n')
+        rtconfig.write('#define RT_CONFIG_H__\n\n')
+
+        empty_line = 1
+
+        for line in config:
+            line = line.lstrip(' ').replace('\n', '').replace('\r', '')
+
+            if len(line) == 0: continue
+
+            if line[0] == '#':
+                if len(line) == 1:
+                    if empty_line:
+                        continue
+
+                    rtconfig.write('\n')
+                    empty_line = 1
+                    continue
+
+                if line.startswith('# CONFIG_'):
+                    line = ' ' + line[9:]
+                else:
+                    line = line[1:]
+                    rtconfig.write('/*%s */\n' % line)
+
+                empty_line = 0
+            else:
+                empty_line = 0
+                setting = line.split('=')
+                if len(setting) >= 2:
+                    if setting[0].startswith('CONFIG_'):
+                        setting[0] = setting[0][7:]
+
+                    if is_pkg_special_config(setting[0]):
+                        continue
+
+                    if setting[1] == 'y':
+                        rtconfig.write('#define %s\n' % setting[0])
+                    else:
+                        rtconfig.write('#define %s %s\n' % (setting[0], re.findall(r"^.*?=(.*)$", line)[0]))
+
+        if os.path.isfile('rtconfig_project.h'):
+            rtconfig.write('#include "rtconfig_project.h"\n')
+
+        rtconfig.write('\n')
+        rtconfig.write('#endif\n')
+
+    config.close()
+
+
 def write_config(deprecated_options, config, filename):
-    CONFIG_HEADING = """#
-# Automatically generated file. DO NOT EDIT.
-# Espressif IoT Development Framework (ESP-IDF) Project Configuration
-#
-"""
-    config.write_config(filename, header=CONFIG_HEADING)
+    config.write_config(filename)
+    mk_rtconfig(filename)
     deprecated_options.append_config(config, filename)
 
 
 def write_makefile(deprecated_options, config, filename):
     CONFIG_HEADING = """#
-# Automatically generated file. DO NOT EDIT.
-# Espressif IoT Development Framework (ESP-IDF) Project Makefile Configuration
 #
 """
     with open(filename, "w") as f:
@@ -330,8 +349,6 @@ def write_makefile(deprecated_options, config, filename):
 
 def write_header(deprecated_options, config, filename):
     CONFIG_HEADING = """/*
- * Automatically generated file. DO NOT EDIT.
- * Espressif IoT Development Framework (ESP-IDF) Configuration Header
  */
 #pragma once
 """
@@ -346,8 +363,6 @@ def write_cmake(deprecated_options, config, filename):
         prefix = config.config_prefix
 
         write("""#
-# Automatically generated file. DO NOT EDIT.
-# Espressif IoT Development Framework (ESP-IDF) Configuration cmake include file
 #
 """)
 
@@ -407,13 +422,7 @@ def write_json(deprecated_options, config, filename):
 
 
 def get_menu_node_id(node):
-    """ Given a menu node, return a unique id
-    which can be used to identify it in the menu structure
-
-    Will either be the config symbol name, or a menu identifier
-    'slug'
-
-    """
+    """    """
     try:
         if not isinstance(node.item, kconfiglib.Choice):
             return node.item.name
@@ -421,13 +430,49 @@ def get_menu_node_id(node):
         pass
 
     result = []
+    linenr = node.linenr
     while node.parent is not None:
         slug = re.sub(r'\W+', '-', node.prompt[0]).lower()
         result.append(slug)
         node = node.parent
-
-    result = "-".join(reversed(result))
+    result = "-".join(reversed(result)) + str(linenr)
     return result
+
+
+def crypto_file(filename):
+
+    def encrypt256(data, password, iv):
+        from Crypto.Cipher import AES
+        bs = AES.block_size
+        pad = lambda s: s + (bs - len(s) % bs) * chr(bs - len(s) % bs)
+        cipher = AES.new(password, AES.MODE_CBC, iv)
+        data = cipher.encrypt(pad(data))
+#         data = iv + data
+        return data
+
+    def encrypt128(data, password, iv):
+        from Crypto.Cipher import AES
+        bs = AES.block_size
+        password = password[:16]
+        iv = iv[:16]
+        pad = lambda s: s + ((bs - len(s) % bs) * chr(bs - len(s) % bs)).encode("utf-8")
+        cipher = AES.new(password, AES.MODE_CBC, iv)
+        data = cipher.encrypt(pad(data))
+#         data = iv + data
+        return data
+
+    aes_key = 'oTFTU3ut5SmfKp33'
+    aes_iv = 'iahTABn123'
+    aes_key += 'xcaZ5BLajJSAMN8s'
+    aes_iv += 'Iob5DR'
+
+    with open(filename, "rb") as f:
+        file_data = f.read()
+#         file_data = encrypt(file_data, aes_key, aes_iv)
+        file_data = encrypt128(file_data, aes_key, aes_iv)
+
+    with open(filename, "wb") as f:
+        f.write(file_data)
 
 
 def write_json_menus(deprecated_options, config, filename):
@@ -460,7 +505,7 @@ def write_json_menus(deprecated_options, config, filename):
                         "depends_on": depends,
                         "children": [],
                         }
-            if is_menuconfig:
+            if is_menuconfig and isinstance(node.item, kconfiglib.Symbol):
                 sym = node.item
                 new_json["name"] = sym.name
                 new_json["help"] = node.help
@@ -518,7 +563,11 @@ def write_json_menus(deprecated_options, config, filename):
 
     config.walk_menu(write_node)
     with open(filename, "w") as f:
-        f.write(json.dumps(result, sort_keys=True, indent=4))
+#         f.write(json.dumps(result, sort_keys=True, indent=4))
+        f.write(json.dumps(result))
+
+    # aes128 cbc
+    crypto_file(filename)
 
 
 def write_docs(deprecated_options, config, filename):
@@ -527,16 +576,16 @@ def write_docs(deprecated_options, config, filename):
 
 
 def update_if_changed(source, destination):
-    with open(source, "r") as f:
+    with open(source, "rb") as f:
         source_contents = f.read()
 
     if os.path.exists(destination):
-        with open(destination, "r") as f:
+        with open(destination, "rb") as f:
             dest_contents = f.read()
         if source_contents == dest_contents:
             return  # nothing to update
 
-    with open(destination, "w") as f:
+    with open(destination, "wb") as f:
         f.write(source_contents)
 
 
@@ -561,5 +610,4 @@ if __name__ == '__main__':
     try:
         main()
     except FatalError as e:
-        print("A fatal error occurred: %s" % e)
         sys.exit(2)

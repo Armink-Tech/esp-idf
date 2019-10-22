@@ -5,18 +5,13 @@
 #
 from __future__ import print_function
 import argparse
-import confgen
+import k2j
 import json
+import kconfiglib
 import os
 import sys
 import tempfile
-from confgen import FatalError, __version__
-
-try:
-    from . import kconfiglib
-except Exception:
-    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-    import kconfiglib
+from k2j import FatalError, __version__
 
 # Min/Max supported protocol versions
 MIN_PROTOCOL_VERSION = 1
@@ -24,31 +19,20 @@ MAX_PROTOCOL_VERSION = 2
 
 
 def main():
-    parser = argparse.ArgumentParser(description='confserver.py v%s - Config Generation Tool' % __version__, prog=os.path.basename(sys.argv[0]))
+    parser = argparse.ArgumentParser(description='kcs', prog=os.path.basename(sys.argv[0]))
 
     parser.add_argument('--config',
-                        help='Project configuration settings',
                         required=True)
 
     parser.add_argument('--kconfig',
-                        help='KConfig file with config item definitions',
                         required=True)
 
-    parser.add_argument('--sdkconfig-rename',
-                        help='File with deprecated Kconfig options',
-                        required=False)
-
-    parser.add_argument('--env', action='append', default=[],
-                        help='Environment to set when evaluating the config file', metavar='NAME=VAL')
-
-    parser.add_argument('--env-file', type=argparse.FileType('r'),
-                        help='Optional file to load environment variables from. Contents '
-                             'should be a JSON object where each key/value pair is a variable.')
-
-    parser.add_argument('--version', help='Set protocol version to use on initial status',
-                        type=int, default=MAX_PROTOCOL_VERSION)
-
     args = parser.parse_args()
+    args.env = []
+    args.env_file = None
+    args.defaults = []
+    args.sdkconfig_rename = False
+    args.version = MAX_PROTOCOL_VERSION
 
     if args.version < MIN_PROTOCOL_VERSION:
         print("Version %d is older than minimum supported protocol version %d. Client is much older than ESP-IDF version?" %
@@ -74,11 +58,17 @@ def main():
     run_server(args.kconfig, args.config, args.sdkconfig_rename)
 
 
+class KconfigStatus(object):
+    def __init__(self, y_selecting, n_selecting):
+        self.y_selecting = y_selecting
+        self.n_selecting = n_selecting
+
+
 def run_server(kconfig, sdkconfig, sdkconfig_rename, default_version=MAX_PROTOCOL_VERSION):
     config = kconfiglib.Kconfig(kconfig)
     sdkconfig_renames = [sdkconfig_rename] if sdkconfig_rename else []
     sdkconfig_renames += os.environ.get("COMPONENT_SDKCONFIG_RENAMES", "").split()
-    deprecated_options = confgen.DeprecatedOptions(config.config_prefix, path_rename_files=sdkconfig_renames)
+    deprecated_options = k2j.DeprecatedOptions(config.config_prefix, path_rename_files = sdkconfig_renames)
     f_o = tempfile.NamedTemporaryFile(mode='w+b', delete=False)
     try:
         with open(sdkconfig, mode='rb') as f_i:
@@ -91,9 +81,10 @@ def run_server(kconfig, sdkconfig, sdkconfig_rename, default_version=MAX_PROTOCO
 
     print("Server running, waiting for requests on stdin...", file=sys.stderr)
 
-    config_dict = confgen.get_json_values(config)
+    config_dict = k2j.get_json_values(config)
     ranges_dict = get_ranges(config)
     visible_dict = get_visible(config)
+    yselects_dict = get_yselects(config)
 
     if default_version == 1:
         # V1: no 'visibility' key, send value None for any invisible item
@@ -101,7 +92,9 @@ def run_server(kconfig, sdkconfig, sdkconfig_rename, default_version=MAX_PROTOCO
         json.dump({"version": 1, "values": values_dict, "ranges": ranges_dict}, sys.stdout)
     else:
         # V2 onwards: separate visibility from version
-        json.dump({"version": default_version, "values": config_dict, "ranges": ranges_dict, "visible": visible_dict}, sys.stdout)
+        return_visible_dict = dict((k if v else None, v) for (k, v) in visible_dict.items())
+        return_yselects_dict = dict((k if v else None, v) for (k, v) in yselects_dict.items())
+        json.dump({"version": default_version, "values": config_dict, "ranges": ranges_dict, "visible": return_visible_dict, "y-selects": return_yselects_dict}, sys.stdout)
     print("\n")
     sys.stdout.flush()
 
@@ -117,9 +110,10 @@ def run_server(kconfig, sdkconfig, sdkconfig_rename, default_version=MAX_PROTOCO
             print("\n")
             sys.stdout.flush()
             continue
-        before = confgen.get_json_values(config)
+        before = k2j.get_json_values(config)
         before_ranges = get_ranges(config)
         before_visible = get_visible(config)
+        before_yselects = get_yselects(config)
 
         if "load" in req:  # load a new sdkconfig
 
@@ -144,13 +138,15 @@ def run_server(kconfig, sdkconfig, sdkconfig_rename, default_version=MAX_PROTOCO
 
         error = handle_request(deprecated_options, config, req)
 
-        after = confgen.get_json_values(config)
+        after = k2j.get_json_values(config)
         after_ranges = get_ranges(config)
         after_visible = get_visible(config)
+        after_yselects = get_yselects(config)
 
         values_diff = diff(before, after)
         ranges_diff = diff(before_ranges, after_ranges)
         visible_diff = diff(before_visible, after_visible)
+        yselects_diff = diff(before_yselects, after_yselects)
         if req["version"] == 1:
             # V1 response, invisible items have value None
             for k in (k for (k,v) in visible_diff.items() if not v):
@@ -158,7 +154,15 @@ def run_server(kconfig, sdkconfig, sdkconfig_rename, default_version=MAX_PROTOCO
             response = {"version": 1, "values": values_diff, "ranges": ranges_diff}
         else:
             # V2+ response, separate visibility values
-            response = {"version": req["version"], "values": values_diff, "ranges": ranges_diff, "visible": visible_diff}
+            if "status" in req:
+                y_selecting = None
+                n_selecting = None
+                if req['result'] :
+                    y_selecting = req['result'].y_selecting
+                    n_selecting = req['result'].n_selecting
+                response = {"version": req["version"], "y_selecting": y_selecting, "n_selecting": n_selecting}
+            else:
+                response = {"version": req["version"], "values": values_diff, "ranges": ranges_diff, "visible": visible_diff, "y-selects": yselects_diff}
         if error:
             for e in error:
                 print("Error: %s" % e, file=sys.stderr)
@@ -190,10 +194,13 @@ def handle_request(deprecated_options, config, req):
     if "set" in req:
         handle_set(config, error, req["set"])
 
+    if "status" in req:
+        handle_status(config, error, req["status"], req)
+
     if "save" in req:
         try:
             print("Saving config to %s..." % req["save"], file=sys.stderr)
-            confgen.write_config(deprecated_options, config, req["save"])
+            k2j.write_config(deprecated_options, config, req["save"])
         except Exception as e:
             error += ["Failed to save to %s: %s" % (req["save"], e)]
 
@@ -231,6 +238,28 @@ def handle_set(config, error, to_set):
 
     if len(to_set):
         error.append("The following config symbol(s) were not visible so were not updated: %s" % (", ".join(s.name for s in to_set)))
+
+
+def handle_status(config, error, get_status, req):
+
+    def sis(expr, val):
+        # sis = selects/implies
+        sis = [si for si in kconfiglib.split_expr(expr, kconfiglib.OR) if kconfiglib.expr_value(si) == val]
+        res = []
+        for si in sis:
+            res += [kconfiglib.split_expr(si, kconfiglib.AND)[0].name]
+        return res
+
+    if get_status not in config.syms:
+        error.append("The following config symbol(s) were not found: %s" % (", ".join(get_status)))
+        return
+    # replace name keys with the full config symbol for each key:
+    get_status = config.syms[get_status]
+    
+    if get_status.visibility is False:
+        return  # no visible keys left
+    
+    req['result'] = KconfigStatus(sis(get_status.rev_dep, 2), sis(get_status.rev_dep, 0))
 
 
 def diff(before, after):
@@ -281,9 +310,36 @@ def get_visible(config):
         result[m] = any(v for (n,v) in result.items() if n.parent == m)
 
     # return a dict mapping the node ID to its visibility.
-    result = dict((confgen.get_menu_node_id(n),v) for (n,v) in result.items())
+    result = dict((k2j.get_menu_node_id(n), v) for (n, v) in result.items())
 
     return result
+
+
+def get_yselects(config):
+
+    selects_dict = {}
+
+    def sis(expr, val):
+        # sis = selects/implies
+        sis = [si for si in kconfiglib.split_expr(expr, kconfiglib.OR) if kconfiglib.expr_value(si) == val]
+        res = []
+        for si in sis:
+            res += [kconfiglib.split_expr(si, kconfiglib.AND)[0].name]
+        return res
+
+    def handle_node(node):
+        sym = node.item
+        if not isinstance(sym, kconfiglib.Symbol):
+            return
+        y_selecting = sis(sym.rev_dep, 2)
+
+        if len(y_selecting) > 0:
+            selects_dict[sym.name] = True
+        else :
+            selects_dict[sym.name] = False
+
+    config.walk_menu(handle_node)
+    return selects_dict
 
 
 if __name__ == '__main__':
