@@ -252,10 +252,10 @@ def mk_rtconfig(filename):
         print('open config:%s failed' % filename)
         return
 
-    with open('rtconfig.h', 'w') as rtconfig:
+    with open('oneos_config.h', 'w') as rtconfig:
 
-        rtconfig.write('#ifndef RT_CONFIG_H__\n')
-        rtconfig.write('#define RT_CONFIG_H__\n\n')
+        rtconfig.write('#ifndef ONEOS_CONFIG_H__\n')
+        rtconfig.write('#define ONEOS_CONFIG_H__\n\n')
 
         empty_line = 1
 
